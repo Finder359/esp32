@@ -216,11 +216,27 @@ static bool extractJsonStringValue(const String &json, const char *key, String &
     return true;
 }
 
+static const char* mapWeatherTextToAscii(const String &weatherText) {
+    if (weatherText == "晴") return "Sunny";
+    if (weatherText == "多云") return "Cloudy";
+    if (weatherText == "阴") return "Overcast";
+    if (weatherText == "小雨") return "LightRain";
+    if (weatherText == "中雨") return "Rain";
+    if (weatherText == "大雨") return "HeavyRain";
+    if (weatherText == "雷阵雨") return "Thunder";
+    if (weatherText == "雾") return "Fog";
+    if (weatherText == "霾") return "Haze";
+    if (weatherText == "小雪") return "LightSnow";
+    if (weatherText == "中雪") return "Snow";
+    if (weatherText == "大雪") return "HeavySnow";
+    return "Unknown";
+}
+
 bool fetchWeatherAndUpdateUi() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Weather fetch skipped: WiFi disconnected");
         if (ui_Label7 != nullptr) {
-            lv_label_set_text(ui_Label7, "天气: 离线");
+            lv_label_set_text(ui_Label7, "Weather: offline");
         }
         return false;
     }
@@ -231,7 +247,7 @@ bool fetchWeatherAndUpdateUi() {
     if (!http.begin(client, WEATHER_URL)) {
         Serial.println("Weather HTTP begin failed");
         if (ui_Label7 != nullptr) {
-            lv_label_set_text(ui_Label7, "天气获取失败");
+            lv_label_set_text(ui_Label7, "Weather begin failed");
         }
         return false;
     }
@@ -243,42 +259,35 @@ bool fetchWeatherAndUpdateUi() {
     if (httpCode != HTTP_CODE_OK) {
         Serial.printf("Weather HTTP code: %d\n", httpCode);
         if (ui_Label7 != nullptr) {
-            lv_label_set_text_fmt(ui_Label7, "天气失败:%d", httpCode);
+            lv_label_set_text_fmt(ui_Label7, "Weather HTTP:%d", httpCode);
         }
         return false;
     }
 
-    String city;
     String temperature;
     String weatherText;
-    bool okCity = extractJsonStringValue(response, "name", city);
     bool okTemp = extractJsonStringValue(response, "temperature", temperature);
     bool okText = extractJsonStringValue(response, "text", weatherText);
 
-    if (!okCity || !okTemp) {
+    if (!okTemp) {
         Serial.println("Weather JSON parse failed");
         if (ui_Label7 != nullptr) {
-            lv_label_set_text(ui_Label7, "天气解析失败");
+            lv_label_set_text(ui_Label7, "Weather parse failed");
         }
         return false;
     }
 
+    const char *weatherAscii = okText ? mapWeatherTextToAscii(weatherText) : "Unknown";
+
     Serial.printf("Weather OK: city=%s temp=%s text=%s\n",
-                  city.c_str(),
+                  "Weihai",
                   temperature.c_str(),
-                  okText ? weatherText.c_str() : "");
+                  weatherAscii);
 
     if (ui_Label7 != nullptr) {
-        if (okText) {
-            lv_label_set_text_fmt(ui_Label7, "城市:%s %sC %s",
-                                  city.c_str(),
-                                  temperature.c_str(),
-                                  weatherText.c_str());
-        } else {
-            lv_label_set_text_fmt(ui_Label7, "城市:%s 温度:%sC",
-                                  city.c_str(),
-                                  temperature.c_str());
-        }
+        lv_label_set_text_fmt(ui_Label7, "Weihai %sC %s",
+                              temperature.c_str(),
+                              weatherAscii);
     }
 
     return true;
