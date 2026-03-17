@@ -4,6 +4,7 @@
 #include <lvgl.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 
 TFT_eSPI tft = TFT_eSPI(); // 初始化屏幕对象
@@ -15,9 +16,10 @@ static const uint8_t TOUCH_MISO = 39;
 static const uint8_t TOUCH_CS = 33;
 static const uint8_t TOUCH_IRQ = 36;
 
-static const char* WIFI_SSID = "MERCURY_111F";
-static const char* WIFI_PASS = "13853516630";
+static const char* WIFI_SSID = "K40";
+static const char* WIFI_PASS = "12345678";
 static const char* SERVER_URL = "http://159.75.181.29/upload.php";
+static const char* WEATHER_URL = "https://api.seniverse.com/v3/weather/now.json?key=ScW402483CrcaSFye&location=weihai&language=zh-Hans&unit=c";
 
 /* 1. 定义显示缓冲区（LVGL 刷屏用） */
 static const uint16_t screenWidth  = 320;
@@ -28,7 +30,10 @@ static lv_color_t buf[screenWidth * 10]; // 缓冲区大小，通常设为屏幕
 static uint32_t lastTick = 0;
 static uint32_t lastTouchLogMs = 0;
 static uint32_t lastClockUiMs = 0;
+static uint32_t lastNtpRetryMs = 0;
+static uint32_t lastWeatherFetchMs = 0;
 static bool timeSynced = false;
+static bool weatherSynced = false;
 
 // 触摸校准参数（原始值），如有偏差可再微调
 static const int TOUCH_RAW_X_MIN = 200;
@@ -39,8 +44,15 @@ static const uint16_t TOUCH_PRESSURE_MIN = 250;
 
 static const char* NTP_SERVER_1 = "ntp.aliyun.com";
 static const char* NTP_SERVER_2 = "pool.ntp.org";
+static const char* NTP_SERVER_3 = "cn.ntp.org.cn";
+static const char* NTP_SERVER_4 = "time.windows.com";
+static const char* NTP_SERVER_5 = "ntp.tencent.com";
+static const char* NTP_SERVER_6 = "time.cloudflare.com";
 static const long GMT_OFFSET_SEC = 8 * 3600;
 static const int DAYLIGHT_OFFSET_SEC = 0;
+static const uint32_t NTP_RETRY_INTERVAL_MS = 60000;
+static const uint32_t WEATHER_UPDATE_INTERVAL_MS = 10 * 60 * 1000;
+static const uint32_t WEATHER_RETRY_INTERVAL_MS = 60 * 1000;
 
 static uint16_t xpt2046Read12(uint8_t command) {
     uint16_t data = 0;
@@ -151,12 +163,10 @@ void connectWifi() {
     }
 }
 
-bool syncNetworkTime() {
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2);
-    Serial.println("Syncing time via NTP...");
-
+static bool waitForTimeSync(uint32_t timeoutMs) {
     struct tm timeinfo;
-    for (int i = 0; i < 20; ++i) {
+    uint32_t startMs = millis();
+    while (millis() - startMs < timeoutMs) {
         if (getLocalTime(&timeinfo, 500)) {
             Serial.printf("Time synced: %04d-%02d-%02d %02d:%02d:%02d\n",
                           timeinfo.tm_year + 1900,
@@ -171,8 +181,107 @@ bool syncNetworkTime() {
         Serial.print("#");
     }
     Serial.println();
+    return false;
+}
+
+bool syncNetworkTime() {
+    Serial.println("Syncing time via NTP (group A)...");
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    if (waitForTimeSync(8000)) {
+        return true;
+    }
+
+    Serial.println("Syncing time via NTP (group B)...");
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_4, NTP_SERVER_5, NTP_SERVER_6);
+    if (waitForTimeSync(8000)) {
+        return true;
+    }
+
     Serial.println("NTP sync timeout");
     return false;
+}
+
+static bool extractJsonStringValue(const String &json, const char *key, String &out) {
+    String token = String("\"") + key + "\":\"";
+    int start = json.indexOf(token);
+    if (start < 0) {
+        return false;
+    }
+    start += token.length();
+    int end = json.indexOf('"', start);
+    if (end < 0) {
+        return false;
+    }
+    out = json.substring(start, end);
+    return true;
+}
+
+bool fetchWeatherAndUpdateUi() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Weather fetch skipped: WiFi disconnected");
+        if (ui_Label7 != nullptr) {
+            lv_label_set_text(ui_Label7, "天气: 离线");
+        }
+        return false;
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    if (!http.begin(client, WEATHER_URL)) {
+        Serial.println("Weather HTTP begin failed");
+        if (ui_Label7 != nullptr) {
+            lv_label_set_text(ui_Label7, "天气获取失败");
+        }
+        return false;
+    }
+
+    int httpCode = http.GET();
+    String response = http.getString();
+    http.end();
+
+    if (httpCode != HTTP_CODE_OK) {
+        Serial.printf("Weather HTTP code: %d\n", httpCode);
+        if (ui_Label7 != nullptr) {
+            lv_label_set_text_fmt(ui_Label7, "天气失败:%d", httpCode);
+        }
+        return false;
+    }
+
+    String city;
+    String temperature;
+    String weatherText;
+    bool okCity = extractJsonStringValue(response, "name", city);
+    bool okTemp = extractJsonStringValue(response, "temperature", temperature);
+    bool okText = extractJsonStringValue(response, "text", weatherText);
+
+    if (!okCity || !okTemp) {
+        Serial.println("Weather JSON parse failed");
+        if (ui_Label7 != nullptr) {
+            lv_label_set_text(ui_Label7, "天气解析失败");
+        }
+        return false;
+    }
+
+    Serial.printf("Weather OK: city=%s temp=%s text=%s\n",
+                  city.c_str(),
+                  temperature.c_str(),
+                  okText ? weatherText.c_str() : "");
+
+    if (ui_Label7 != nullptr) {
+        if (okText) {
+            lv_label_set_text_fmt(ui_Label7, "城市:%s %sC %s",
+                                  city.c_str(),
+                                  temperature.c_str(),
+                                  weatherText.c_str());
+        } else {
+            lv_label_set_text_fmt(ui_Label7, "城市:%s 温度:%sC",
+                                  city.c_str(),
+                                  temperature.c_str());
+        }
+    }
+
+    return true;
 }
 
 void updateDateTimeUi(bool force) {
@@ -293,8 +402,11 @@ void setup() {
     }
 
     connectWifi();
+    lastNtpRetryMs = millis();
+    lastWeatherFetchMs = millis();
     if (WiFi.status() == WL_CONNECTED) {
         timeSynced = syncNetworkTime();
+        weatherSynced = fetchWeatherAndUpdateUi();
     }
     if (!timeSynced) {
         Serial.println("Time not synced, UI will show fallback text until sync succeeds");
@@ -313,6 +425,25 @@ void loop() {
 
     // 4. 给 LVGL 提供时钟心跳（极其重要！）
     lv_timer_handler(); 
+
+    if (!timeSynced && WiFi.status() == WL_CONNECTED) {
+        uint32_t nowMs = millis();
+        if (nowMs - lastNtpRetryMs >= NTP_RETRY_INTERVAL_MS) {
+            Serial.println("NTP retry triggered (1 minute interval)");
+            timeSynced = syncNetworkTime();
+            lastNtpRetryMs = nowMs;
+        }
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        uint32_t nowMs = millis();
+        uint32_t weatherInterval = weatherSynced ? WEATHER_UPDATE_INTERVAL_MS : WEATHER_RETRY_INTERVAL_MS;
+        if (nowMs - lastWeatherFetchMs >= weatherInterval) {
+            Serial.println("Weather update triggered");
+            weatherSynced = fetchWeatherAndUpdateUi();
+            lastWeatherFetchMs = nowMs;
+        }
+    }
 
     updateDateTimeUi(false);
 
