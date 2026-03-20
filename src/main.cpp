@@ -6,6 +6,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
+#include <DHT.h>
 
 TFT_eSPI tft = TFT_eSPI(); // 初始化屏幕对象
 
@@ -18,8 +19,15 @@ static const uint8_t TOUCH_IRQ = 36;
 
 static const char* WIFI_SSID = "K40";
 static const char* WIFI_PASS = "12345678";
-static const char* SERVER_URL = "http://159.75.181.29/upload.php";
+static const char* SERVER_URL = "http://159.75.181.29/api.php?action=upload";
+static const char* API_KEY = "5f8d2b7a9c1e4f6b8d0a3c5e7b9a1d2f";
+static const char* DEVICE_ID = "ESP32_Room";
 static const char* WEATHER_URL = "https://api.seniverse.com/v3/weather/now.json?key=ScW402483CrcaSFye&location=weihai&language=zh-Hans&unit=c";
+#ifndef DHT_PIN
+#define DHT_PIN 27
+#endif
+static const uint8_t DHT_PIN_DEFAULT = DHT_PIN;
+static const uint8_t DHT_TYPE = DHT22;
 
 /* 1. 定义显示缓冲区（LVGL 刷屏用） */
 static const uint16_t screenWidth  = 320;
@@ -32,8 +40,49 @@ static uint32_t lastTouchLogMs = 0;
 static uint32_t lastClockUiMs = 0;
 static uint32_t lastNtpRetryMs = 0;
 static uint32_t lastWeatherFetchMs = 0;
+static uint32_t lastDhtReadMs = 0;
+static uint32_t lastUploadMs = 0;
 static bool timeSynced = false;
 static bool weatherSynced = false;
+static float lastTempC = NAN;
+static float lastHumidity = NAN;
+static bool dhtBootLogDone = false; // 只在第一次成功读取 DHT22 时打印一次日志，避免后续频繁打印
+static const uint32_t SENSOR_UPLOAD_INTERVAL_MS = 60 * 1000;
+
+DHT dht(DHT_PIN_DEFAULT, DHT_TYPE);
+
+static void updateDhtUi(float tempC, float humidity, bool valid) {
+    if (ui_Label8 == nullptr) {
+        return;
+    }
+
+    if (!valid) {
+        lv_label_set_text(ui_Label8, "Temp: --.- C\nHumi: --.- %");
+        return;
+    }
+
+    String uiText = "Temp: " + String(tempC, 1) + " C\nHumi: " + String(humidity, 1) + " %";
+    lv_label_set_text(ui_Label8, uiText.c_str());
+}
+
+static void updateLastUpdatedLog() {
+    if (ui_Label3 == nullptr) {
+        return;
+    }
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 10)) {
+        lv_label_set_text_fmt(ui_Label3,
+                              "Last updated %02d:%02d:%02d",
+                              timeinfo.tm_hour,
+                              timeinfo.tm_min,
+                              timeinfo.tm_sec);
+        return;
+    }
+
+    uint32_t sec = millis() / 1000;
+    lv_label_set_text_fmt(ui_Label3, "Last updated %lus", sec);
+}
 
 // 触摸校准参数（原始值），如有偏差可再微调
 static const int TOUCH_RAW_X_MIN = 200;
@@ -325,12 +374,14 @@ void updateDateTimeUi(bool force) {
     }
 }
 
-void sendPresetData() {
+void uploadSensorData() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected, skip POST");
-        if (ui_Label3 != nullptr) {
-            lv_label_set_text(ui_Label3, "WiFi not connected");
-        }
+        return;
+    }
+
+    if (isnan(lastTempC) || isnan(lastHumidity)) {
+        Serial.println("No valid DHT22 data yet, skip POST");
         return;
     }
 
@@ -338,8 +389,13 @@ void sendPresetData() {
     http.begin(SERVER_URL);
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
 
-    // 预置的一组测试数据
-    String postData = "temp=28.5&humi=60.2&device_id=1";
+    String postData;
+    postData.reserve(192);
+    postData = "action=upload"
+               "&api_key=" + String(API_KEY) +
+               "&temp=" + String(lastTempC, 1) +
+               "&humi=" + String(lastHumidity, 1) +
+               "&device_id=" + String(DEVICE_ID);
     int httpCode = http.POST(postData);
     String response = http.getString();
 
@@ -347,12 +403,12 @@ void sendPresetData() {
     Serial.printf("POST body: %s\n", postData.c_str());
     Serial.printf("Server response: %s\n", response.c_str());
 
-    if (ui_Label3 != nullptr) {
-        if (httpCode > 0) {
-            lv_label_set_text_fmt(ui_Label3, "Upload OK: %d", httpCode);
-        } else {
-            lv_label_set_text_fmt(ui_Label3, "Upload FAIL: %d", httpCode);
-        }
+    if (httpCode == 200 && response.indexOf("\"ok\":true") >= 0) {
+        updateLastUpdatedLog();
+    } else if (httpCode == 401) {
+        Serial.println("Upload failed: API_KEY invalid (401)");
+    } else {
+        Serial.println("Upload failed: backend did not return ok=true");
     }
 
     http.end();
@@ -361,11 +417,13 @@ void sendPresetData() {
 void onSendButtonClicked(lv_event_t *e) {
     LV_UNUSED(e);
     Serial.println("Button PRESSED event captured");
-    sendPresetData();
+    uploadSensorData();
 }
 
 void setup() {
     Serial.begin(115200);
+    dht.begin();
+    Serial.printf("DHT22 init on GPIO%d\n", DHT_PIN_DEFAULT);
 
     // 初始化 TFT
     tft.begin();
@@ -404,6 +462,10 @@ void setup() {
 
     // 3. 调用 SquareLine 生成的 UI 初始化
     ui_init(); 
+    updateDhtUi(0.0f, 0.0f, false);
+    if (ui_Label3 != nullptr) {
+        lv_label_set_text(ui_Label3, "Last updated --:--:--");
+    }
 
     if (ui_Button1 != nullptr) {
         lv_obj_add_event_cb(ui_Button1, onSendButtonClicked, LV_EVENT_PRESSED, NULL);
@@ -413,6 +475,7 @@ void setup() {
     connectWifi();
     lastNtpRetryMs = millis();
     lastWeatherFetchMs = millis();
+    lastUploadMs = millis();
     if (WiFi.status() == WL_CONNECTED) {
         timeSynced = syncNetworkTime();
         weatherSynced = fetchWeatherAndUpdateUi();
@@ -451,6 +514,31 @@ void loop() {
             Serial.println("Weather update triggered");
             weatherSynced = fetchWeatherAndUpdateUi();
             lastWeatherFetchMs = nowMs;
+        }
+
+        if (nowMs - lastUploadMs >= SENSOR_UPLOAD_INTERVAL_MS) {
+            uploadSensorData();
+            lastUploadMs = nowMs;
+        }
+    }
+
+    if (millis() - lastDhtReadMs >= 2000) {
+        lastDhtReadMs = millis();
+        float humidity = dht.readHumidity();
+        float tempC = dht.readTemperature();
+
+        if (isnan(humidity) || isnan(tempC)) {
+            lastTempC = NAN;
+            lastHumidity = NAN;
+            updateDhtUi(0.0f, 0.0f, false);
+        } else {
+            if (!dhtBootLogDone) {
+                Serial.printf("DHT22(GPIO%d) -> Temp: %.1f C, Humi: %.1f %%\n", DHT_PIN_DEFAULT, tempC, humidity);
+                dhtBootLogDone = true;
+            }
+            lastTempC = tempC;
+            lastHumidity = humidity;
+            updateDhtUi(tempC, humidity, true);
         }
     }
 
